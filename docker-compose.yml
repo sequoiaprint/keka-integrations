@@ -1,0 +1,12 @@
+services:
+  keka_integration_server:
+    build: .
+    container_name: keka_integration
+    ports:
+      - "5080:5080"
+    volumes:
+      - .:/app
+      - /app/node_modules
+    env_file:
+      - .env
+    command: npm run dev
