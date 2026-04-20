@@ -16,6 +16,7 @@ import { scheduleAttendanceCollection, manualAttendanceSync } from "./utils/atte
 import machineIdleRoutes from "./routes/machineIdleRoutes";
 import OverTimeRoutes from "./routes/OverTimeRoutes";
 import nightShiftRoutes from "./routes/NightShiftRoutes";
+import leavesRoutes from "./routes/leavesRoutes";
 dotenv.config();
 const app = express();
 const port = process.env.Port;
@@ -28,10 +29,6 @@ scheduleTokenRefresh();
 scheduleEmployeeCollection();
 scheduleAttendanceCollection();
 
-manualAttendanceSync().catch(error => {
-  console.error(' First-time attendance sync failed:', error);
-});
-
 
 //api routes 
 app.use("/employees", employeeRoutes);
@@ -40,6 +37,7 @@ app.use("/api/dashboard", dashboardRoutes);
 app.use("/api", machineIdleRoutes);
 app.use("/api/overtimeRouter", OverTimeRoutes);
 app.use("/api", nightShiftRoutes);
+app.use("/leaves", leavesRoutes);
 
 //for docker
 app.get("/health", (_req, res) => {
