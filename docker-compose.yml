@@ -1,12 +1,16 @@
 services:
   keka_integration_server:
+    image: keka_integration_server:latest
     build: .
     container_name: keka_integration
-    ports:
-      - "5080:5080"
-    volumes:
-      - .:/app
-      - /app/node_modules
     env_file:
       - .env
-    command: npm run dev
+    ports:
+      - "5080:5080"
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:5080/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
