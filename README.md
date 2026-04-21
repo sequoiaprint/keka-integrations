@@ -1739,3 +1739,229 @@ GET /api/overtime/:machine/:timeFilter        # Overtime with job details
 
 ---
 
+# 🚀 CI/CD Pipeline
+
+This project uses **GitHub Actions** for continuous integration and deployment to AWS EC2. Every push to the `main` branch automatically builds, tests, and deploys the Keka Integration Server with zero downtime and automatic rollback on failure.
+
+## Pipeline Overview
+
+```
+git push → main
+      │
+      ▼
+┌─────────────────────────┐
+│  CI: Build & Type Check  │  ← Runs on GitHub's ubuntu runner
+│  • npm ci               │
+│  • tsc (TypeScript)     │
+└────────────┬────────────┘
+             │ passes
+             ▼
+┌─────────────────────────┐
+│  CD: Deploy to EC2       │  ← SSHs into AWS EC2
+│  • git pull origin main │
+│  • docker-compose build │  ← Old container still running
+│  • docker-compose up -d │  ← Swap (< 2s downtime)
+│  • Health check /health │  ← localhost:5080/health
+└─────────────────────────┘
+             │
+     ┌───────┴───────┐
+     ▼               ▼
+ HTTP 200         HTTP ≠ 200
+ Cleanup          Auto rollback
+ Success          to previous image
+```
+
+## Key Safety Features
+
+- **Zero downtime during build** — the new image is compiled while the old container keeps serving traffic. Only the final swap causes a brief interruption (~2 seconds).
+- **Build failure protection** — if `docker-compose build` fails, `set -e` stops the script immediately. The running container is never touched.
+- **Automatic rollback** — before every deploy, the current image is tagged `:rollback`. If the health check fails after deployment, the pipeline restores the previous image and reverts the git state on disk.
+- **Real HTTP health check** — the pipeline hits `http://localhost:5080/health` and verifies a `200` response. A running-but-broken server will still trigger a rollback.
+- **Compose-native rollback** — rollback always uses `docker-compose`, ensuring the container stays on the correct Docker network with the correct environment variables from `.env`.
+
+## GitHub Secrets Required
+
+Go to your repo → **Settings → Secrets and variables → Actions** and add these four secrets:
+
+| Secret Name | Description | Example Value |
+|---|---|---|
+| `AWS_HOST` | EC2 public IP address | `13.233.177.4` |
+| `AWS_USER` | EC2 login username | `ubuntu` |
+| `AWS_SSH_KEY` | Full contents of your `.pem` private key file | `-----BEGIN RSA PRIVATE KEY-----...` |
+| `AWS_DEPLOY_PATH_KEKA` | Absolute path to this project on EC2 | `/home/ubuntu/keka-integrations` |
+
+## Workflow File
+
+The pipeline is defined in `.github/workflows/deploy.yml`:
+
+```yaml
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-test:
+    name: CI — Build & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build TypeScript
+        run: npm run build
+
+  deploy:
+    name: CD — Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.AWS_HOST }}
+          username: ${{ secrets.AWS_USER }}
+          key: ${{ secrets.AWS_SSH_KEY }}
+          script: |
+            set -e
+            cd ${{ secrets.AWS_DEPLOY_PATH_KEKA }}
+
+            # One-time fix: untrack dist/ if still tracked
+            if git ls-files --error-unmatch dist/ > /dev/null 2>&1; then
+              echo "→ Removing dist/ from git index..."
+              git rm -r --cached dist/
+            fi
+
+            # Snapshot current commit for code rollback
+            PREVIOUS_COMMIT=$(git rev-parse HEAD)
+            echo "→ Stable commit snapshot: $PREVIOUS_COMMIT"
+
+            # Pull latest code
+            echo "→ Pulling latest code..."
+            git pull origin main
+
+            # Tag current running image as rollback target
+            # || true: safe to ignore on very first deploy when no image exists yet
+            docker tag keka_integration_server:latest keka_integration_server:rollback 2>/dev/null || true
+
+            # Build new image BEFORE stopping running container
+            # If this fails, set -e exits here. Old container keeps running untouched.
+            echo "→ Building new image..."
+            docker-compose build
+
+            # Swap containers
+            echo "→ Swapping containers..."
+            docker-compose up -d --remove-orphans
+
+            # Health check against real HTTP endpoint
+            echo "→ Waiting 15s for service to stabilise..."
+            sleep 15
+
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5080/health || echo "000")
+            echo "→ Health check response: $HTTP_STATUS"
+
+            if [ "$HTTP_STATUS" != "200" ]; then
+              echo "✗ Health check failed (HTTP $HTTP_STATUS). Rolling back..."
+
+              docker-compose down --remove-orphans
+              docker tag keka_integration_server:rollback keka_integration_server:latest 2>/dev/null || true
+              docker-compose up -d --remove-orphans
+
+              # Roll back code on disk to match restored image
+              git reset --hard "$PREVIOUS_COMMIT"
+
+              echo "✓ Rolled back to commit $PREVIOUS_COMMIT"
+              exit 1
+            fi
+
+            # Cleanup
+            docker image prune -f
+            echo "✓ Deployment successful!"
+```
+
+## EC2 One-Time Setup
+
+The following steps are required once on the EC2 instance to allow the pipeline to authenticate with GitHub and pull from the private repository.
+
+**1. Generate a deploy key on EC2:**
+```bash
+ssh-keygen -t ed25519 -C "ec2-deploy" -f ~/.ssh/github_deploy -N ""
+cat ~/.ssh/github_deploy.pub
+```
+
+**2. Add the public key to GitHub:**
+
+Go to your repo → **Settings → Deploy keys → Add deploy key**, paste the output, title it `EC2 Deploy`, and leave write access unchecked.
+
+**3. Configure SSH on EC2 to use the deploy key:**
+```bash
+cat >> ~/.ssh/config << 'EOF'
+Host github.com
+  IdentityFile ~/.ssh/github_deploy
+  StrictHostKeyChecking no
+EOF
+```
+
+**4. Add GitHub to known hosts:**
+```bash
+ssh-keyscan github.com >> ~/.ssh/known_hosts
+```
+
+**5. Verify the connection:**
+```bash
+ssh -T git@github.com
+# Expected: Hi sequoiaprint/keka-integrations! You've successfully authenticated...
+```
+
+## Health Endpoint
+
+The pipeline depends on a `/health` endpoint in the Express app running on port `5080`. The Docker Compose healthcheck is already configured:
+
+```yaml
+# docker-compose.yml
+healthcheck:
+  test: ["CMD", "curl", "-f", "http://localhost:5080/health"]
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 20s
+```
+
+Ensure your `server.ts` exposes this endpoint:
+
+```typescript
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'OK',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
+});
+```
+
+## Rollback Behaviour
+
+| Failure Point | What Happens | Service Impact |
+|---|---|---|
+| `npm run build` fails in CI | Pipeline stops. EC2 never touched. | No impact |
+| `git pull` fails on EC2 | `set -e` stops script. Container unchanged. | No impact |
+| `docker-compose build` fails | `set -e` stops script. Old container still running. | No impact |
+| Container crashes after swap | Health check fails → auto rollback to `:rollback` image | ~15s detection + recovery |
+| Server returns non-200 | Health check fails → auto rollback to `:rollback` image | ~15s detection + recovery |
+
+## Monitoring a Deploy
+
+Go to your repo → **Actions tab** to watch any deployment in real time. Each step streams its output live. A green checkmark means the deployment succeeded and the health check passed. A red X means something failed — click the job to see exactly which step and why.
+
+---
