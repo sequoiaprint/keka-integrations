@@ -1,0 +1,78 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-test:
+    name: CI — Build & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build TypeScript
+        run: npm run build
+
+  deploy:
+    name: CD — Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.AWS_HOST }}
+          username: ${{ secrets.AWS_USER }}
+          key: ${{ secrets.AWS_SSH_KEY }}
+          script: |
+            set -e
+            cd ${{ secrets.AWS_DEPLOY_PATH_KEKA }}
+
+            if git ls-files --error-unmatch dist/ > /dev/null 2>&1; then
+              echo "→ Removing dist/ from git index..."
+              git rm -r --cached dist/
+            fi
+
+            PREVIOUS_COMMIT=$(git rev-parse HEAD)
+            echo "→ Stable commit snapshot: $PREVIOUS_COMMIT"
+
+            echo "→ Pulling latest code..."
+            git pull origin main
+
+            docker tag keka_integration_server:latest keka_integration_server:rollback 2>/dev/null || true
+
+            echo "→ Building new image..."
+            docker-compose build
+
+            echo "→ Swapping containers..."
+            docker-compose up -d --remove-orphans
+
+            echo "→ Waiting 15s for service to stabilise..."
+            sleep 15
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5080/health || echo "000")
+            echo "→ Health check response: $HTTP_STATUS"
+
+            if [ "$HTTP_STATUS" != "200" ]; then
+              echo "✗ Health check failed (HTTP $HTTP_STATUS). Rolling back..."
+              docker-compose down --remove-orphans
+              docker tag keka_integration_server:rollback keka_integration_server:latest 2>/dev/null || true
+              docker-compose up -d --remove-orphans
+              git reset --hard "$PREVIOUS_COMMIT"
+              echo "✓ Rolled back to commit $PREVIOUS_COMMIT"
+              exit 1
+            fi
+
+            docker image prune -f
+            echo "✓ Deployment successful!"
