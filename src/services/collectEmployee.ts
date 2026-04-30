@@ -41,6 +41,9 @@ interface KekaEmployee {
   reportsTo?: KekaReportsTo; // Accurate Keka API structure for manager evaluation
   workLocation?: KekaWorkLocation; // Added back to support hybrid location API formats
   jobTitle?: KekaJobTitle; // Added to map missing title rows on insertion
+  // FIX: Added fallback department fields — Keka may expose department outside of groups
+  department?: { name: string } | null;
+  departmentName?: string | null;
 }
 
 interface KekaApiResponse {
@@ -323,7 +326,6 @@ const convertToMySQLDate = (apiDate?: string | null): string | null => {
 const syncEmployeesWithDatabase = async (kekaEmployees: KekaEmployee[], dbEmployees: DatabaseEmployee[]): Promise<void> => {
   let updates = 0;
 
-
   for (const kekaEmployee of kekaEmployees) {
     try {
       // Extract all fields directly from Keka data
@@ -337,14 +339,27 @@ const syncEmployeesWithDatabase = async (kekaEmployees: KekaEmployee[], dbEmploy
         ? `${kekaEmployee.reportsTo.firstName} ${kekaEmployee.reportsTo.lastName}`.trim()
         : null;
 
-      // Department mapping (groupType === 2)
+      // FIX: Department/division mapping with three-tier fallback:
+      //   1. groups array entry with groupType === 2 (standard department group)
+      //   2. kekaEmployee.department?.name (top-level department object, if present)
+      //   3. kekaEmployee.departmentName (flat string field, if present)
+      // This ensures division is populated regardless of which field Keka uses.
       const departmentGroup = kekaEmployee.groups?.find((g: KekaGroup) => g.groupType === 2);
-      const groupName = departmentGroup?.title || null;
+      const division =
+        departmentGroup?.title ||
+        kekaEmployee.department?.name ||
+        kekaEmployee.departmentName ||
+        null;
 
       // FIX: Support both groups and workLocation for location extraction
       const locationGroup = kekaEmployee.groups?.find((g: KekaGroup) => g.groupType === 3);
       const locationId = locationGroup?.id || kekaEmployee.workLocation?.id || null;
       const locationName = locationGroup?.title || kekaEmployee.workLocation?.name || null;
+
+      // Machine mapping (groupType === 4) — e.g. "GTO", "Gravure", "Punching 1", "Silk Screen"
+      // Only populated when Keka has a groupType 4 entry; null otherwise (preserves manual values)
+      const machineGroup = kekaEmployee.groups?.find((g: KekaGroup) => g.groupType === 4);
+      const machine = machineGroup?.title || null;
 
       const jobTitle = kekaEmployee.jobTitle?.title || null;
 
@@ -356,16 +371,22 @@ const syncEmployeesWithDatabase = async (kekaEmployees: KekaEmployee[], dbEmploy
 
       if (existingEmployee.length > 0) {
         // Employee exists → UPDATE
+        // FIX: Added `division` to UPDATE so existing rows with NULL division get corrected.
+        // Previously only `group_name` was set; `division` (read by all reports) was never written.
+        // Only update `machine` when Keka provides a value — preserves manually-set machine values.
         await pool.query(
           `UPDATE employees
-           SET name = ?, jobtitle = ?, joining_date = ?, manager_name = ?, group_name = ?, location_id = ?, location_name = ?
+           SET name = ?, jobtitle = ?, joining_date = ?, manager_name = ?, group_name = ?, division = ?,
+               machine = COALESCE(?, machine), location_id = ?, location_name = ?
            WHERE employee_id = ?`,
           [
             kekaEmployee.displayName,
             jobTitle,
             mysqlDate,
             managerName,
-            groupName,
+            division,
+            division,
+            machine,
             locationId,
             locationName,
             kekaEmployee.id
@@ -376,16 +397,19 @@ const syncEmployeesWithDatabase = async (kekaEmployees: KekaEmployee[], dbEmploy
         // Employee does not exist → INSERT new row
         // FIX (MYSQL): Include regularShiftStart/End to prevent duty_hours GENERATED column
         // from evaluating TIMESTAMPDIFF against NULL, causing ER_TRUNCATED_WRONG_VALUE in strict mode
+        // FIX: Added `division` and `machine` to INSERT so new employees are fully populated from day one.
         await pool.query(
           `INSERT INTO employees (
-            employee_id, name, jobtitle, manager_name, group_name, location_id, location_name, joining_date, regularShiftStart, regularShiftEnd
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '00:00:00', '00:00:00')`,
+            employee_id, name, jobtitle, manager_name, group_name, division, machine, location_id, location_name, joining_date, regularShiftStart, regularShiftEnd
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '00:00:00', '00:00:00')`,
           [
             kekaEmployee.id,
             kekaEmployee.displayName,
             jobTitle,
             managerName,
-            groupName,
+            division,
+            division,
+            machine,
             locationId,
             locationName,
             mysqlDate
