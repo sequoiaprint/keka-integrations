@@ -44,6 +44,9 @@ interface KekaEmployee {
   // FIX: Added fallback department fields — Keka may expose department outside of groups
   department?: { name: string } | null;
   departmentName?: string | null;
+  workPhone?: string;
+  homePhone?: string;
+  mobilePhone?: string;
 }
 
 interface KekaApiResponse {
@@ -63,6 +66,7 @@ interface DatabaseEmployee {
   group_name?: string;
   location_id?: string;
   location_name?: string;
+  phone?: string;
 }
 
 // Rate limiting constants for employee API
@@ -215,7 +219,7 @@ export const collectAndSyncEmployees = async (): Promise<void> => {
 
     // Get existing employees from database
     // Modified to also fetch manager_name, group_name, location_id, location_name to evaluate if an update is needed
-    const [dbEmployees] = await pool.query("SELECT employee_id, name, joining_date, manager_name, group_name, location_id, location_name FROM employees") as [DatabaseEmployee[], any];
+    const [dbEmployees] = await pool.query("SELECT employee_id, name, joining_date, manager_name, group_name, location_id, location_name, phone FROM employees") as [DatabaseEmployee[], any];
     // console.log(` Found ${dbEmployees.length} employees in database`);
 
     // Sync employees with database - ONLY UPDATE EXISTING ONES
@@ -236,7 +240,7 @@ export const collectAndSyncEmployees = async (): Promise<void> => {
         //console.log(" Using cached employee data from Redis due to API failure");
         const allFilteredEmployees: KekaEmployee[] = JSON.parse(cachedData);
         // Modified fallback query to match the extended fields same as the main query
-        const [dbEmployees] = await pool.query("SELECT employee_id, name, joining_date, manager_name, group_name, location_id, location_name FROM employees") as [DatabaseEmployee[], any];
+        const [dbEmployees] = await pool.query("SELECT employee_id, name, joining_date, manager_name, group_name, location_id, location_name, phone FROM employees") as [DatabaseEmployee[], any];
         await syncEmployeesWithDatabase(allFilteredEmployees, dbEmployees);
         //console.log(" Sync completed using cached data");
       }
@@ -362,6 +366,8 @@ const syncEmployeesWithDatabase = async (kekaEmployees: KekaEmployee[], dbEmploy
       const machine = machineGroup?.title || null;
 
       const jobTitle = kekaEmployee.jobTitle?.title || null;
+      
+      const phone = kekaEmployee.mobilePhone || kekaEmployee.workPhone || null;
 
       // Check if employee already exists in DB by employee_id
       const [existingEmployee] = await pool.query(
@@ -377,7 +383,7 @@ const syncEmployeesWithDatabase = async (kekaEmployees: KekaEmployee[], dbEmploy
         await pool.query(
           `UPDATE employees
            SET name = ?, jobtitle = ?, joining_date = ?, manager_name = ?, group_name = ?, division = ?,
-               machine = COALESCE(?, machine), location_id = ?, location_name = ?
+               machine = COALESCE(?, machine), location_id = ?, location_name = ?, phone = ?
            WHERE employee_id = ?`,
           [
             kekaEmployee.displayName,
@@ -389,6 +395,7 @@ const syncEmployeesWithDatabase = async (kekaEmployees: KekaEmployee[], dbEmploy
             machine,
             locationId,
             locationName,
+            phone,
             kekaEmployee.id
           ]
         );
@@ -400,8 +407,8 @@ const syncEmployeesWithDatabase = async (kekaEmployees: KekaEmployee[], dbEmploy
         // FIX: Added `division` and `machine` to INSERT so new employees are fully populated from day one.
         await pool.query(
           `INSERT INTO employees (
-            employee_id, name, jobtitle, manager_name, group_name, division, machine, location_id, location_name, joining_date, regularShiftStart, regularShiftEnd
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '00:00:00', '00:00:00')`,
+            employee_id, name, jobtitle, manager_name, group_name, division, machine, location_id, location_name, joining_date, phone, regularShiftStart, regularShiftEnd
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '00:00:00', '00:00:00')`,
           [
             kekaEmployee.id,
             kekaEmployee.displayName,
@@ -412,7 +419,8 @@ const syncEmployeesWithDatabase = async (kekaEmployees: KekaEmployee[], dbEmploy
             machine,
             locationId,
             locationName,
-            mysqlDate
+            mysqlDate,
+            phone
           ]
         );
         updates++; // Count inserts too

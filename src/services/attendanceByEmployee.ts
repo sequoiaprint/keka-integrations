@@ -511,6 +511,26 @@ const saveAttendanceData = async (
       const lastOut = attendance.lastOutOfTheDay?.timestamp ? 
         convertToIST(attendance.lastOutOfTheDay.timestamp) : null;
 
+      // Calculate late minutes
+      let late_minutes = 0;
+      if (!attendance.shiftStartTime || !attendance.firstInOfTheDay?.timestamp) {
+        late_minutes = 0;
+      } else {
+        const shiftStartObj = new Date(attendance.shiftStartTime);
+        const firstInObj = new Date(attendance.firstInOfTheDay.timestamp);
+        
+        if (isNaN(shiftStartObj.getTime()) || isNaN(firstInObj.getTime())) {
+          late_minutes = 0;
+        } else {
+          const IST_OFFSET = 5.5 * 60 * 60 * 1000;
+          const shiftStartIST = new Date(shiftStartObj.getTime() + IST_OFFSET);
+          const firstInIST = new Date(firstInObj.getTime() + IST_OFFSET);
+
+          const diffMs = firstInIST.getTime() - shiftStartIST.getTime();
+          late_minutes = Math.max(0, Math.floor(diffMs / (1000 * 60)));
+        }
+      }
+
       // Validate required fields
       if (!shiftStart || !shiftEnd) {
         console.warn(` Skipping record with invalid shift times for employee ${employeeId} on ${attendanceDate}`);
@@ -538,7 +558,8 @@ const saveAttendanceData = async (
             total_break_duration = ?,
             total_effective_hours = ?,
             total_effective_overtime_duration = ?,
-            is_offday = ?
+            is_offday = ?,
+            late_minutes = ?
           WHERE employee_id = ? AND attendance_date = ?`,
           [
             attendance.id,
@@ -552,6 +573,7 @@ const saveAttendanceData = async (
             attendance.totalEffectiveHours || 0,
             attendance.totalEffectiveOvertimeDuration || 0,
             isOffday,
+            late_minutes,
             employeeId,
             attendanceDate
           ]
@@ -565,8 +587,8 @@ const saveAttendanceData = async (
           `INSERT INTO attendance (
             id, employee_id, attendance_date, shift_start, shift_end, shift_duration,
             first_in_of_the_day_time, last_out_of_the_day_time, total_gross_hours,
-            total_break_duration, total_effective_hours, total_effective_overtime_duration, is_offday
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            total_break_duration, total_effective_hours, total_effective_overtime_duration, is_offday, late_minutes
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             attendance.id,
             employeeId,
@@ -580,7 +602,8 @@ const saveAttendanceData = async (
             attendance.totalBreakDuration || 0,
             attendance.totalEffectiveHours || 0,
             attendance.totalEffectiveOvertimeDuration || 0,
-            isOffday
+            isOffday,
+            late_minutes
           ]
         );
 
